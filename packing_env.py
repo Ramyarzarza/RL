@@ -78,8 +78,10 @@ class RectanglePackingEnv(gym.Env):
         # ── Action space ────────────────────────────────────────────────────
         # Flat index = rotation * (zone_w * zone_h) + y * zone_w + x
         # rotation ∈ {0, 1}  →  0 = original, 1 = 90° CCW
+        # Last action: skip current item
         self.n_positions = zone_w * zone_h
-        self.action_space = spaces.Discrete(2 * self.n_positions)
+        self.skip_action_idx = 2 * self.n_positions  # Index of skip action
+        self.action_space = spaces.Discrete(2 * self.n_positions + 1)  # +1 for skip
 
         # ── Observation space ────────────────────────────────────────────────
         # [ grid (zone_w*zone_h floats, 0/1)
@@ -142,10 +144,16 @@ class RectanglePackingEnv(gym.Env):
         Boolean mask over all actions.
         Used by sb3_contrib.MaskablePPO.
         """
-        mask = np.zeros(2 * self.n_positions, dtype=bool)
+        mask = np.zeros(2 * self.n_positions + 1, dtype=bool)  # +1 for skip
         item = self._current_item
+
+        # Skip action is always allowed (unless all items packed)
+        if item is not None:
+            mask[self.skip_action_idx] = True
+
         if item is None:
             return mask
+
         for rot in range(2):
             w, h = (item[0], item[1]) if rot == 0 else (item[1], item[0])
             base = rot * self.n_positions
@@ -153,9 +161,10 @@ class RectanglePackingEnv(gym.Env):
                 for x in range(self.zone_w):
                     if _can_place(self.grid, x, y, w, h):
                         mask[base + y * self.zone_w + x] = True
-        # If every action is invalid, allow all (avoids empty-mask crash)
-        if not np.any(mask):
-            mask[:] = True
+        # If every placement action is invalid, allow all (avoids empty-mask crash)
+        # Skip action is still available in the mask
+        if not np.any(mask[:-1]):  # Check only placement actions, not skip
+            mask[:-1] = True
         return mask
 
     # ── Gymnasium API ────────────────────────────────────────────────────────
@@ -172,6 +181,8 @@ class RectanglePackingEnv(gym.Env):
 
         self.grid = np.zeros((self.zone_h, self.zone_w), dtype=np.int8)
         self.items = self._generate_items()
+        # sort items by area (largest first) to make learning easier
+        # self.items.sort(key=lambda x: x[0] * x[1], reverse=True)
         self.current_idx = 0
         self.placed_items = []
         self.invalid_count = 0
@@ -187,7 +198,23 @@ class RectanglePackingEnv(gym.Env):
         if item is None:
             return self._build_obs(), 0.0, True, False, {}
 
-        # ── Decode action ────────────────────────────────────────────────────
+        # ── Check if skip action ────────────────────────────────────────────
+        if int(action) == self.skip_action_idx:
+            # Skip current item and move to next
+            # reward = minus area of skipped item to encourage packing more items
+            reward = -0.5 * item[0] * item[1]
+            self.current_idx += 1
+
+            terminated = self.current_idx >= len(self.items)
+            info = dict(
+                placed=len(self.placed_items),
+                total=len(self.items),
+                utilisation=float(self.grid.sum()) / (self.zone_w * self.zone_h),
+                action_type="skip",
+            )
+            return self._build_obs(), reward, terminated, False, info
+
+        # ── Decode placement action ──────────────────────────────────────────
         rot = int(action) // self.n_positions  # 0 or 1
         pos = int(action) % self.n_positions
         x = pos % self.zone_w
@@ -215,9 +242,10 @@ class RectanglePackingEnv(gym.Env):
             reward = float(w * h)  # area reward
             self.current_idx += 1
 
-            if self.current_idx >= len(self.items):
+            # if grid is full
+            if self.grid.sum() == self.zone_w * self.zone_h:
                 terminated = True
-                reward += 200.0  # bonus: all items packed!
+                reward += self.zone_w * self.zone_h  # bonus: all items packed!
                 info["all_packed"] = True
         else:
             # Invalid placement
