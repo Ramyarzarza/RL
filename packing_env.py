@@ -30,6 +30,37 @@ def _can_place(grid: np.ndarray, x: int, y: int, w: int, h: int) -> bool:
     return not np.any(grid[y : y + h, x : x + w])
 
 
+def _largest_connected_free_area(grid: np.ndarray) -> int:
+    """Find the largest connected region of free (empty) cells using BFS."""
+    zone_h, zone_w = grid.shape
+    visited = np.zeros_like(grid, dtype=bool)
+    max_area = 0
+
+    for y in range(zone_h):
+        for x in range(zone_w):
+            if grid[y, x] == 0 and not visited[y, x]:  # Empty cell not visited
+                # BFS to find connected component
+                area = 0
+                queue = [(x, y)]
+                visited[y, x] = True
+
+                while queue:
+                    cx, cy = queue.pop(0)
+                    area += 1
+
+                    # Check 4 neighbors (up, down, left, right)
+                    for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < zone_w and 0 <= ny < zone_h:
+                            if grid[ny, nx] == 0 and not visited[ny, nx]:
+                                visited[ny, nx] = True
+                                queue.append((nx, ny))
+
+                max_area = max(max_area, area)
+
+    return max_area
+
+
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
@@ -239,7 +270,20 @@ class RectanglePackingEnv(gym.Env):
                     color=self._item_colors[self.current_idx],
                 )
             )
-            reward = float(w * h)  # area reward
+
+            # Area reward
+            reward = float(w * h)
+
+            # Bonus for maintaining large connected free space
+            # Avoid fragmented placements that waste edges
+            largest_free_area = _largest_connected_free_area(self.grid)
+            max_possible_free = self.zone_w * self.zone_h - self.grid.sum()
+
+            # Reward: how much of remaining space is contiguous (not fragmented)
+            if max_possible_free > 0:
+                contiguity_ratio = largest_free_area / max_possible_free
+                reward *= contiguity_ratio
+
             self.current_idx += 1
 
             # if grid is full
